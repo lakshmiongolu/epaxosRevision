@@ -18,7 +18,7 @@ import (
 
 var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost")
 var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7077.")
-var reqsNb *int = flag.Int("q", 5000, "Total number of requests. Defaults to 5000.")
+var reqsNb *int = flag.Int("q", 5, "Total number of requests. Defaults to 5000.")
 var writes *int = flag.Int("w", 100, "Percentage of updates (writes). Defaults to 100%.")
 var noLeader *bool = flag.Bool("e", false, "Egalitarian (no leader). Defaults to false.")
 var fast *bool = flag.Bool("f", false, "Fast Paxos: send message directly to all replicas. Defaults to false.")
@@ -81,8 +81,11 @@ func main() {
 			r = rand.Intn(100)
 			if r < *conflicts {
 				karray[i] = 42
+
+				// karray[i] = i
 			} else {
 				karray[i] = int64(43 + i)
+				// log.Println("key being sent = \n", karray[i])
 			}
 			r = rand.Intn(100)
 			if r < *writes {
@@ -160,6 +163,7 @@ func main() {
 				args.Command.Op = state.GET
 			}
 			args.Command.K = state.Key(karray[i])
+			log.Println("key being sent = ", karray[i])
 			args.Command.V = state.Value(i)
 			//args.Timestamp = time.Now().UnixNano()
 			if !*fast {

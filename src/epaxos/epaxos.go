@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"epaxosproto"
 	"fastrpc"
+	"fmt"
 	"genericsmr"
 	"genericsmrproto"
 	"io"
 	"log"
 	"math"
+	"sort"
 	"state"
 	"sync"
 	"time"
@@ -37,6 +39,15 @@ const CHECKPOINT_PERIOD = 10000
 
 var cpMarker []state.Command
 var cpcounter = 0
+
+// Ticker to reset every sec
+const R_TIME = 1
+
+// Number of top keys to store in new map
+const NEW_SIZE = 10
+
+// Threshold to remove from hot map: 40%
+const THRESHOLD = 0.4
 
 type Replica struct {
 	*genericsmr.Replica
@@ -74,6 +85,9 @@ type Replica struct {
 	latestCPInstance      int32
 	clientMutex           *sync.Mutex // for synchronizing when sending replies to clients from multiple go-routines
 	instancesToRecover    chan *instanceId
+
+	keyHistory    map[state.Key]*keySeenHelper
+	HotKeyHistory map[state.Key]*hotKeySeenHelper
 }
 
 type Instance struct {
@@ -117,34 +131,44 @@ type LeaderBookkeeping struct {
 	possibleQuorum    []bool
 	tpaOKs            int
 }
+type keySeenHelper struct {
+	keyInHP       int32   //counter to keep track: how many times a key appeared in Handle Propose
+	keyInSlowPath int32   //counter to keep track: how many times a key appeared in slow path
+	prevServ      []int32 //keep track of what servers served that key
+}
+
+type hotKeySeenHelper struct {
+	keyInHP  int32
+	keyInSP  int32
+	hotCount int32
+}
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool, beacon bool, durable bool) *Replica {
+	// kh := &keySeenHelper{0, 0, make([]int32, 1000)}
 	r := &Replica{
-		genericsmr.NewReplica(id, peerAddrList, thrifty, exec, dreply),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*2),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		make([][]*Instance, len(peerAddrList)),
-		make([]int32, len(peerAddrList)),
-		[DS]int32{-1, -1, -1, -1, -1},
-		make([]int32, len(peerAddrList)),
-		nil,
-		make([]map[state.Key]int32, len(peerAddrList)),
-		make(map[state.Key]int32),
-		0,
-		0,
-		-1,
-		new(sync.Mutex),
-		make(chan *instanceId, genericsmr.CHAN_BUFFER_SIZE)}
+		Replica:               genericsmr.NewReplica(id, peerAddrList, thrifty, exec, dreply),
+		prepareChan:           make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		preAcceptChan:         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		acceptChan:            make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		commitChan:            make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		commitShortChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		prepareReplyChan:      make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		preAcceptReplyChan:    make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
+		preAcceptOKChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
+		acceptReplyChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*2),
+		tryPreAcceptChan:      make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		tryPreAcceptReplyChan: make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		InstanceSpace:         make([][]*Instance, len(peerAddrList)),
+		crtInstance:           make([]int32, len(peerAddrList)),
+		CommittedUpTo:         [DS]int32{-1, -1, -1, -1, -1},
+		ExecedUpTo:            make([]int32, len(peerAddrList)),
+		conflicts:             make([]map[state.Key]int32, len(peerAddrList)),
+		maxSeqPerKey:          make(map[state.Key]int32),
+		latestCPInstance:      -1,
+		clientMutex:           new(sync.Mutex),
+		instancesToRecover:    make(chan *instanceId, genericsmr.CHAN_BUFFER_SIZE),
+		keyHistory:            make(map[state.Key]*keySeenHelper),
+		HotKeyHistory:         make(map[state.Key]*hotKeySeenHelper)}
 
 	r.Beacon = beacon
 	r.Durable = durable
@@ -704,8 +728,8 @@ func (r *Replica) updateConflicts(cmds []state.Command, replica int32, instance 
 				r.conflicts[replica][cmds[i].K] = instance
 			}
 		} else {
-            r.conflicts[replica][cmds[i].K] = instance
-        }
+			r.conflicts[replica][cmds[i].K] = instance
+		}
 		if s, present := r.maxSeqPerKey[cmds[i].K]; present {
 			if s < seq {
 				r.maxSeqPerKey[cmds[i].K] = seq
@@ -797,10 +821,132 @@ func bfFromCommands(cmds []state.Command) *bloomfilter.Bloomfilter {
                             PHASE 1
 
 ***********************************************************************/
+// find key of given value and return it
+func (r *Replica) findKey(value int) state.Key {
+	for k, v := range r.keyHistory {
+		if int(v.keyInHP) == value {
+			return k
+		}
+	}
+	return 0
+}
+
+// recursive find key for duplicate values
+func (r *Replica) findNextKey(key state.Key, val int) state.Key {
+	keyFound := false
+	for k, v := range r.keyHistory {
+		if keyFound {
+			if v.keyInHP == int32(val) {
+				return k
+			}
+		}
+		if k == key {
+			keyFound = true
+		}
+	}
+	return 0
+}
+
+// find top N values from the old map and return the list
+func (r *Replica) findTopN() []int {
+	values := make([]int, 0, len(r.keyHistory))
+	for _, v := range r.keyHistory {
+		values = append(values, int(v.keyInHP))
+	}
+	// sort in descending order
+	sort.Sort(sort.Reverse(sort.IntSlice(values)))
+	return values
+}
+
+// Copy k: HP#, SP#, currCount to hotMap
+func (r *Replica) hotMapCopy(sortedList []int) {
+	for v := range sortedList {
+		key := r.findKey(v)
+		_, isPresent := r.HotKeyHistory[key]
+		for isPresent {
+			// key for some duplicated value
+			key = r.findNextKey(key, v)
+			_, isPresentAgain := r.HotKeyHistory[key]
+			isPresent = isPresentAgain
+		}
+		// Update new hot map
+		hks := &hotKeySeenHelper{}
+		hks.keyInHP = int32(v)
+		hks.keyInSP = r.keyHistory[key].keyInSlowPath
+		hks.hotCount = 0
+		r.HotKeyHistory[key] = hks
+	}
+}
+func (r *Replica) tickerReset() {
+	// Ticker to tick every second
+	ticker := time.NewTicker(R_TIME * time.Second)
+	// for every sec: check if map has enough elements; if yes: copy top 10
+	for _ = range ticker.C {
+		if len(r.keyHistory) >= NEW_SIZE {
+			// 1. Find sorted values
+			sortedValList := r.findTopN()
+			// 2. Copy top 10 to new map
+			r.hotMapCopy(sortedValList)
+			// 3. Reset old map
+			for k, _ := range r.keyHistory {
+				delete(r.keyHistory, k)
+			}
+		}
+		// Remove key from hot list if hot count < 40% (propose count)
+		if len(r.HotKeyHistory) > 0 {
+			for k, v := range r.HotKeyHistory {
+				// if it is less than 40% of what it used to be
+				if v.hotCount < (THRESHOLD * 1000) {
+					// remove that entry from hot map
+					delete(r.HotKeyHistory, k)
+				}
+			}
+		}
+	}
+
+}
 
 func (r *Replica) handlePropose(propose *genericsmr.Propose) {
-	//TODO!! Handle client retries
+	//TODO!! Handle client
 
+	// for every sec: get top 10 into new map and reset old
+	go r.tickerReset()
+
+	fmt.Println("IN HANDLE PROPOOOOOSE")
+	k := propose.Command.K
+	fmt.Println(k)
+
+	//update Key History: Add it
+	_, isPresent := r.keyHistory[k]
+	if isPresent {
+		// Increment keyInHP value
+		r.keyHistory[k].keyInHP += 1
+		log.Println("Hot Key if========== ", r.keyHistory[k].keyInHP)
+	} else {
+		// Add the key
+		// Initialize KeySeenHelper struct
+		ks := &keySeenHelper{}
+		// Set keyInHP value
+		ks.keyInHP = 1
+		r.keyHistory[k] = ks
+		log.Println("Hot Key else========== ", ks.keyInHP)
+	}
+
+	//update Hot Key History: hot count
+	_, isPresent = r.HotKeyHistory[k]
+	if isPresent {
+		r.HotKeyHistory[k].hotCount += 1
+		log.Println("Hot COUNT========== ", r.HotKeyHistory[k].hotCount)
+	}
+
+	if r.keyHistory[k].keyInHP > 10 {
+		// It is a hot key
+		log.Println("Hot Key in HP appeared more than 10 times========== ", k)
+		// sendToServ := kshelp.prevServ[k%r.N]
+		//TODO!! send proposal to that server alone !!!!!!!!!!!!!!!!!
+	}
+
+	// NORMAL PROCESS CONTINUES FOR NOW
 	batchSize := len(r.ProposeChan) + 1
 	if batchSize > MAX_BATCH {
 		batchSize = MAX_BATCH
@@ -809,7 +955,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	instNo := r.crtInstance[r.Id]
 	r.crtInstance[r.Id]++
 
-	dlog.Printf("Starting instance %d\n", instNo)
+	dlog.Printf("handle instance %d\n", instNo)
 	dlog.Printf("Batching %d\n", batchSize)
 
 	cmds := make([]state.Command, batchSize)
@@ -1074,8 +1220,18 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 			weird++
 		}
 		slow++
+
+		// Detecting slow path keys
+		for i := 0; i < len(inst.Cmds); i++ {
+			cmd := inst.Cmds[i]
+			r.keyHistory[cmd.K].keyInSlowPath += 1
+			log.Println("Hot Key ========== %d\n", cmd.K)
+		}
+		// Detecting slow path keys
+
 		inst.Status = epaxosproto.ACCEPTED
 		r.bcastAccept(pareply.Replica, pareply.Instance, inst.ballot, int32(len(inst.Cmds)), inst.Seq, inst.Deps)
+
 	}
 	//TODO: take the slow path if messages are slow to arrive
 }
@@ -1135,8 +1291,18 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 			weird++
 		}
 		slow++
+
+		// Detecting slow path keys
+		for i := 0; i < len(inst.Cmds); i++ {
+			cmd := inst.Cmds[i]
+			r.keyHistory[cmd.K].keyInSlowPath += 1
+			log.Println("Hot Key ========== %d\n", cmd.K)
+		}
+		// Detecting slow path keys
+
 		inst.Status = epaxosproto.ACCEPTED
 		r.bcastAccept(r.Id, pareply.Instance, inst.ballot, int32(len(inst.Cmds)), inst.Seq, inst.Deps)
+
 	}
 	//TODO: take the slow path if messages are slow to arrive
 }
