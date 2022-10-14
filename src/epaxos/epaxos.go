@@ -138,9 +138,9 @@ type keySeenHelper struct {
 }
 
 type hotKeySeenHelper struct {
-	keyInHP  int32
-	keyInSP  int32
-	hotCount int32
+	keyInHP  int32 // Save propose count for hot key
+	keyInSP  int32 // Save slow path count for hot key
+	hotCount int32 // save hot count for hot key
 }
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool, beacon bool, durable bool) *Replica {
