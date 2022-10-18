@@ -45,7 +45,7 @@ const R_TIME = 1
 // Number of top keys to store in new map
 const NEW_SIZE = 10
 
-// Threshold to remove from hot map: 40%: can changehhh
+// Threshold to remove from hot map: 40%: can changehhhh
 const THRESHOLD = 0.4
 
 type Replica struct {
