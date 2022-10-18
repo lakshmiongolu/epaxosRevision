@@ -23,7 +23,6 @@ const TRUE = uint8(1)
 const FALSE = uint8(0)
 const DS = 5
 const ADAPT_TIME_SEC = 10
-
 const MAX_BATCH = 1000
 
 const COMMIT_GRACE_PERIOD = 10 * 1e9 //10 seconds
@@ -46,7 +45,7 @@ const R_TIME = 1
 // Number of top keys to store in new map
 const NEW_SIZE = 10
 
-// Threshold to remove from hot map: 40%
+// Threshold to remove from hot map: 40%: can changehhh
 const THRESHOLD = 0.4
 
 type Replica struct {
@@ -138,9 +137,9 @@ type keySeenHelper struct {
 }
 
 type hotKeySeenHelper struct {
-	keyInHP  int32 // Save propose count for hot key
-	keyInSP  int32 // Save slow path count for hot key
-	hotCount int32 // save hot count for hot key
+	keyInHP  int32
+	keyInSP  int32
+	hotCount int32
 }
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool, beacon bool, durable bool) *Replica {
