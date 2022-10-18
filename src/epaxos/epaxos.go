@@ -45,7 +45,7 @@ const R_TIME = 1
 // Number of top keys to store in new map
 const NEW_SIZE = 10
 
-// Threshold to remove from hot map: 40%: can changehhhh
+// Threshold to remove from hot map: 40%
 const THRESHOLD = 0.4
 
 type Replica struct {
@@ -915,8 +915,14 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	k := propose.Command.K
 	fmt.Println(k)
 
-	//update Key History: Add it
+	//update Hot Key History: hot count - If key present
+	_, isPresentHot := r.HotKeyHistory[k]
 	_, isPresent := r.keyHistory[k]
+	if isPresentHot {
+		r.HotKeyHistory[k].hotCount += 1
+		log.Println("Hot COUNT========== ", r.HotKeyHistory[k].hotCount)
+	}
+	//update Key History: Add it
 	if isPresent {
 		// Increment keyInHP value
 		r.keyHistory[k].keyInHP += 1
@@ -929,13 +935,6 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 		ks.keyInHP = 1
 		r.keyHistory[k] = ks
 		log.Println("Hot Key else========== ", ks.keyInHP)
-	}
-
-	//update Hot Key History: hot count
-	_, isPresent = r.HotKeyHistory[k]
-	if isPresent {
-		r.HotKeyHistory[k].hotCount += 1
-		log.Println("Hot COUNT========== ", r.HotKeyHistory[k].hotCount)
 	}
 
 	if r.keyHistory[k].keyInHP > 10 {
