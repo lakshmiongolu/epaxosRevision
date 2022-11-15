@@ -18,9 +18,9 @@ import (
 
 var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost")
 var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7077.")
-var reqsNb *int = flag.Int("q", 5, "Total number of requests. Defaults to 5000.")
+var reqsNb *int = flag.Int("q", 5000, "Total number of requests. Defaults to 5000.")
 var writes *int = flag.Int("w", 100, "Percentage of updates (writes). Defaults to 100%.")
-var noLeader *bool = flag.Bool("e", false, "Egalitarian (no leader). Defaults to false.")
+var noLeader *bool = flag.Bool("e", true, "Egalitarian (no leader). Defaults to false.")
 var fast *bool = flag.Bool("f", false, "Fast Paxos: send message directly to all replicas. Defaults to false.")
 var rounds *int = flag.Int("r", 1, "Split the total number of requests into this many rounds, and do rounds sequentially. Defaults to 1.")
 var procs *int = flag.Int("p", 2, "GOMAXPROCS. Defaults to 2")
@@ -163,17 +163,20 @@ func main() {
 				args.Command.Op = state.GET
 			}
 			args.Command.K = state.Key(karray[i])
-			log.Println("key being sent = ", karray[i])
+			log.Println("Sending key = ", karray[i])
 			args.Command.V = state.Value(i)
 			//args.Timestamp = time.Now().UnixNano()
 			if !*fast {
+				log.Println("Sending in slow path")
 				if *noLeader {
 					leader = rarray[i]
+					log.Println("To server = ", leader)
 				}
 				writers[leader].WriteByte(genericsmrproto.PROPOSE)
 				args.Marshal(writers[leader])
 			} else {
 				//send to everyone
+				log.Println("Sending in fast path (all servers)")
 				for rep := 0; rep < N; rep++ {
 					writers[rep].WriteByte(genericsmrproto.PROPOSE)
 					args.Marshal(writers[rep])
