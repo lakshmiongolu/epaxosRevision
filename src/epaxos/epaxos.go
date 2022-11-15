@@ -43,9 +43,15 @@ var cpcounter = 0
 const R_TIME = 1
 
 // Number of top keys to store in new map
-const NEW_SIZE = 10
+const NEW_SIZE = 5
 
-// Threshold to remove from hot map: 40%: can changehhhh
+// Minimum number of keys to be present in old map
+const MIN_LENGTH = 10
+
+// KeyinHP for a key should be minimum these many times
+const keyHP_COUNT = 10
+
+// Threshold to remove from hot map: 40%
 const THRESHOLD = 0.4
 
 type Replica struct {
@@ -141,6 +147,21 @@ type hotKeySeenHelper struct {
 	keyInSP  int32
 	hotCount int32
 }
+
+// -------- For getting Top N from old map --------
+type dataSlice []*keySeenHelper
+
+func (d dataSlice) Len() int {
+	return len(d)
+}
+func (d dataSlice) Swap(i, j int) {
+	d[i], d[j] = d[j], d[i]
+}
+func (d dataSlice) Less(i, j int) bool {
+	return d[i].keyInHP > d[j].keyInHP
+}
+
+// -------- For getting Top N from old map --------
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool, beacon bool, durable bool) *Replica {
 	// kh := &keySeenHelper{0, 0, make([]int32, 1000)}
@@ -325,7 +346,11 @@ func (r *Replica) run() {
 		go r.stopAdapting()
 	}
 
+	// for every sec: get top 10 into new map and reset old
+	go r.tickerReset()
+
 	onOffProposeChan := r.ProposeChan
+	fmt.Println("onOffProposeChan = ", onOffProposeChan)
 
 	for !r.Shutdown {
 
@@ -334,6 +359,7 @@ func (r *Replica) run() {
 		case propose := <-onOffProposeChan:
 			//got a Propose from a client
 			dlog.Printf("Proposal with op %d\n", propose.Command.Op)
+			//fmt.Printf("Inside propose channel to call handle propose")
 			r.handlePropose(propose)
 			//deactivate new proposals channel to prioritize the handling of other protocol messages,
 			//and to allow commands to accumulate for batching
@@ -342,12 +368,14 @@ func (r *Replica) run() {
 
 		case <-fastClockChan:
 			//activate new proposals channel
+			// fmt.Printf("Inside activate new proposals channel")
 			onOffProposeChan = r.ProposeChan
 			break
 
 		case prepareS := <-r.prepareChan:
 			prepare := prepareS.(*epaxosproto.Prepare)
 			//got a Prepare message
+			//fmt.Printf("got a prepare message")
 			dlog.Printf("Received Prepare for instance %d.%d\n", prepare.Replica, prepare.Instance)
 			r.handlePrepare(prepare)
 			break
@@ -355,6 +383,7 @@ func (r *Replica) run() {
 		case preAcceptS := <-r.preAcceptChan:
 			preAccept := preAcceptS.(*epaxosproto.PreAccept)
 			//got a PreAccept message
+			//fmt.Printf("got a PreAccept message")
 			dlog.Printf("Received PreAccept for instance %d.%d\n", preAccept.LeaderId, preAccept.Instance)
 			r.handlePreAccept(preAccept)
 			break
@@ -362,6 +391,7 @@ func (r *Replica) run() {
 		case acceptS := <-r.acceptChan:
 			accept := acceptS.(*epaxosproto.Accept)
 			//got an Accept message
+			//fmt.Printf("got an Accept message")
 			dlog.Printf("Received Accept for instance %d.%d\n", accept.LeaderId, accept.Instance)
 			r.handleAccept(accept)
 			break
@@ -369,6 +399,7 @@ func (r *Replica) run() {
 		case commitS := <-r.commitChan:
 			commit := commitS.(*epaxosproto.Commit)
 			//got a Commit message
+			//fmt.Printf("got a Commit message")
 			dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
 			r.handleCommit(commit)
 			break
@@ -376,6 +407,7 @@ func (r *Replica) run() {
 		case commitS := <-r.commitShortChan:
 			commit := commitS.(*epaxosproto.CommitShort)
 			//got a Commit message
+			//fmt.Printf("got a CommitShortChan message")
 			dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
 			r.handleCommitShort(commit)
 			break
@@ -383,6 +415,7 @@ func (r *Replica) run() {
 		case prepareReplyS := <-r.prepareReplyChan:
 			prepareReply := prepareReplyS.(*epaxosproto.PrepareReply)
 			//got a Prepare reply
+			//fmt.Printf("got a PrepareReply message")
 			dlog.Printf("Received PrepareReply for instance %d.%d\n", prepareReply.Replica, prepareReply.Instance)
 			r.handlePrepareReply(prepareReply)
 			break
@@ -390,6 +423,7 @@ func (r *Replica) run() {
 		case preAcceptReplyS := <-r.preAcceptReplyChan:
 			preAcceptReply := preAcceptReplyS.(*epaxosproto.PreAcceptReply)
 			//got a PreAccept reply
+			//fmt.Printf("got a preAcceptReply message")
 			dlog.Printf("Received PreAcceptReply for instance %d.%d\n", preAcceptReply.Replica, preAcceptReply.Instance)
 			r.handlePreAcceptReply(preAcceptReply)
 			break
@@ -397,6 +431,7 @@ func (r *Replica) run() {
 		case preAcceptOKS := <-r.preAcceptOKChan:
 			preAcceptOK := preAcceptOKS.(*epaxosproto.PreAcceptOK)
 			//got a PreAccept reply
+			//fmt.Printf("got a preAccept reply message")
 			dlog.Printf("Received PreAcceptOK for instance %d.%d\n", r.Id, preAcceptOK.Instance)
 			r.handlePreAcceptOK(preAcceptOK)
 			break
@@ -404,23 +439,27 @@ func (r *Replica) run() {
 		case acceptReplyS := <-r.acceptReplyChan:
 			acceptReply := acceptReplyS.(*epaxosproto.AcceptReply)
 			//got an Accept reply
+			//fmt.Printf("got an AcceptReply message")
 			dlog.Printf("Received AcceptReply for instance %d.%d\n", acceptReply.Replica, acceptReply.Instance)
 			r.handleAcceptReply(acceptReply)
 			break
 
 		case tryPreAcceptS := <-r.tryPreAcceptChan:
 			tryPreAccept := tryPreAcceptS.(*epaxosproto.TryPreAccept)
+			//fmt.Printf("got a tryPreAcceptChan message")
 			dlog.Printf("Received TryPreAccept for instance %d.%d\n", tryPreAccept.Replica, tryPreAccept.Instance)
 			r.handleTryPreAccept(tryPreAccept)
 			break
 
 		case tryPreAcceptReplyS := <-r.tryPreAcceptReplyChan:
 			tryPreAcceptReply := tryPreAcceptReplyS.(*epaxosproto.TryPreAcceptReply)
+			//fmt.Printf("got a tryPreAcceptReply message")
 			dlog.Printf("Received TryPreAcceptReply for instance %d.%d\n", tryPreAcceptReply.Replica, tryPreAcceptReply.Instance)
 			r.handleTryPreAcceptReply(tryPreAcceptReply)
 			break
 
 		case beacon := <-r.BeaconChan:
+			//fmt.Printf("got a beacon from replica")
 			dlog.Printf("Received Beacon from replica %d with timestamp %d\n", beacon.Rid, beacon.Timestamp)
 			r.ReplyBeacon(beacon)
 			break
@@ -820,132 +859,136 @@ func bfFromCommands(cmds []state.Command) *bloomfilter.Bloomfilter {
                             PHASE 1
 
 ***********************************************************************/
-// find key of given value and return it
-func (r *Replica) findKey(value int) state.Key {
-	for k, v := range r.keyHistory {
-		if int(v.keyInHP) == value {
-			return k
-		}
-	}
-	return 0
-}
-
-// recursive find key for duplicate values
-func (r *Replica) findNextKey(key state.Key, val int) state.Key {
-	keyFound := false
-	for k, v := range r.keyHistory {
-		if keyFound {
-			if v.keyInHP == int32(val) {
-				return k
-			}
-		}
-		if k == key {
-			keyFound = true
-		}
-	}
-	return 0
-}
-
-// find top N values from the old map and return the list
-func (r *Replica) findTopN() []int {
-	values := make([]int, 0, len(r.keyHistory))
-	for _, v := range r.keyHistory {
-		values = append(values, int(v.keyInHP))
-	}
-	// sort in descending order
-	sort.Sort(sort.Reverse(sort.IntSlice(values)))
-	return values
-}
 
 // Copy k: HP#, SP#, currCount to hotMap
-func (r *Replica) hotMapCopy(sortedList []int) {
-	for v := range sortedList {
-		key := r.findKey(v)
-		_, isPresent := r.HotKeyHistory[key]
-		for isPresent {
-			// key for some duplicated value
-			key = r.findNextKey(key, v)
-			_, isPresentAgain := r.HotKeyHistory[key]
-			isPresent = isPresentAgain
-		}
-		// Update new hot map
+func (r *Replica) copyToHotMap(k state.Key) {
+
+	_, isPresent := r.HotKeyHistory[k]
+	if isPresent {
+		r.HotKeyHistory[k].keyInSP += r.keyHistory[k].keyInSlowPath
+		r.HotKeyHistory[k].keyInHP += r.keyHistory[k].keyInHP
+	} else {
+		// create a new entry for that key not in hot map
 		hks := &hotKeySeenHelper{}
-		hks.keyInHP = int32(v)
-		hks.keyInSP = r.keyHistory[key].keyInSlowPath
+		hks.keyInHP = r.keyHistory[k].keyInHP
+		hks.keyInSP = r.keyHistory[k].keyInSlowPath
 		hks.hotCount = 0
-		r.HotKeyHistory[key] = hks
+		r.HotKeyHistory[k] = hks
 	}
+
+}
+func (r *Replica) sortAndCopy() {
+	s := make(dataSlice, 0, len(r.keyHistory))
+	for _, d := range r.keyHistory {
+		s = append(s, d)
+	}
+	sort.Sort(s)
+	for _, d := range s {
+		fmt.Printf("Sorted old map has %+v\n", *d)
+	}
+
+	full := false
+	fmt.Println("Copy to hot map")
+	for _, d := range s {
+		for k, v := range r.keyHistory {
+			if v == d {
+				// put it in the hot map
+				r.copyToHotMap(k)
+			}
+			// if hot map has enough values : break
+			if len(r.HotKeyHistory) == NEW_SIZE {
+				full = true
+				break
+			}
+		}
+		if full {
+			break
+		}
+	}
+
+	// print hot map
+	r.printHotMap()
+
 }
 func (r *Replica) tickerReset() {
+	fmt.Println("RESETTINGGGGGGG")
 	// Ticker to tick every second
 	ticker := time.NewTicker(R_TIME * time.Second)
 	// for every sec: check if map has enough elements; if yes: copy top 10
 	for _ = range ticker.C {
-		if len(r.keyHistory) >= NEW_SIZE {
-			// 1. Find sorted values
-			sortedValList := r.findTopN()
-			// 2. Copy top 10 to new map
-			r.hotMapCopy(sortedValList)
+		if len(r.keyHistory) >= MIN_LENGTH {
+			// 1, 2. Find sorted values and copy
+			fmt.Println("Finding sorted values")
+			r.sortAndCopy()
 			// 3. Reset old map
+			fmt.Println("Reset old map")
 			for k, _ := range r.keyHistory {
 				delete(r.keyHistory, k)
 			}
 		}
 		// Remove key from hot list if hot count < 40% (propose count)
-		if len(r.HotKeyHistory) > 0 {
+		/*if len(r.HotKeyHistory) > 0 {
 			for k, v := range r.HotKeyHistory {
 				// if it is less than 40% of what it used to be
-				if v.hotCount < (THRESHOLD * 1000) {
+				if v.hotCount < (THRESHOLD * 100) {
 					// remove that entry from hot map
 					delete(r.HotKeyHistory, k)
 				}
 			}
-		}
+		}*/
 	}
 
+}
+
+func (r *Replica) storeValues(proposals []*genericsmr.Propose) {
+
+	for i := 0; i < len(proposals); i++ {
+		fmt.Println("IN HANDLE PROPOOOOOSE")
+		k := proposals[i].Command.K
+		fmt.Println(k)
+
+		//update Hot Key History: hot count - If key present
+		_, isPresentHot := r.HotKeyHistory[k]
+		_, isPresent := r.keyHistory[k]
+		if isPresentHot {
+			r.HotKeyHistory[k].hotCount += 1
+			log.Println("In hot map already========== ", r.HotKeyHistory[k].hotCount)
+		} else if isPresent {
+			//update Key History: Add it
+			// Increment keyInHP value
+			r.keyHistory[k].keyInHP += 1
+			log.Println("Not in hot map > but in old map========== ", r.keyHistory[k].keyInHP)
+		} else {
+			// Add the key
+			// Initialize KeySeenHelper struct
+			ks := &keySeenHelper{}
+			// Set keyInHP value
+			ks.keyInHP = 1
+			r.keyHistory[k] = ks
+			log.Println("Not in both maps > New key > save it in old map ========== ", ks.keyInHP)
+		}
+
+		/* if r.keyHistory[k].keyInHP > NEW_SIZE {
+			// It is a hot key
+			log.Println("Hot Key in HP appeared more than 10 times========== ", k)
+			// sendToServ := kshelp.prevServ[k%r.N]
+			//TODO!! send proposal to that server alone !!!!!!!!!!!!!!!!!
+		}*/
+	}
+
+}
+
+func (r *Replica) printHotMap() {
+	fmt.Println("---------------HOT KEYS ARE---------------------------")
+	for key, val := range r.HotKeyHistory {
+		fmt.Println(key, val.keyInHP, val.hotCount)
+	}
 }
 
 func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	//TODO!! Handle client
 
-	// for every sec: get top 10 into new map and reset old
-	go r.tickerReset()
-
-	fmt.Println("IN HANDLE PROPOOOOOSE")
-	k := propose.Command.K
-	fmt.Println(k)
-
-	//update Key History: Add it
-	_, isPresent := r.keyHistory[k]
-	if isPresent {
-		// Increment keyInHP value
-		r.keyHistory[k].keyInHP += 1
-		log.Println("Hot Key if========== ", r.keyHistory[k].keyInHP)
-	} else {
-		// Add the key
-		// Initialize KeySeenHelper struct
-		ks := &keySeenHelper{}
-		// Set keyInHP value
-		ks.keyInHP = 1
-		r.keyHistory[k] = ks
-		log.Println("Hot Key else========== ", ks.keyInHP)
-	}
-
-	//update Hot Key History: hot count
-	_, isPresent = r.HotKeyHistory[k]
-	if isPresent {
-		r.HotKeyHistory[k].hotCount += 1
-		log.Println("Hot COUNT========== ", r.HotKeyHistory[k].hotCount)
-	}
-
-	if r.keyHistory[k].keyInHP > 10 {
-		// It is a hot key
-		log.Println("Hot Key in HP appeared more than 10 times========== ", k)
-		// sendToServ := kshelp.prevServ[k%r.N]
-		//TODO!! send proposal to that server alone !!!!!!!!!!!!!!!!!
-	}
-
-	// NORMAL PROCESS CONTINUES FOR NOW
+	// NORMAL PROCESS CONTINUES
 	batchSize := len(r.ProposeChan) + 1
 	if batchSize > MAX_BATCH {
 		batchSize = MAX_BATCH
@@ -954,7 +997,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	instNo := r.crtInstance[r.Id]
 	r.crtInstance[r.Id]++
 
-	dlog.Printf("handle instance %d\n", instNo)
+	// dlog.Printf("handle instance %d\n", instNo)
 	dlog.Printf("Batching %d\n", batchSize)
 
 	cmds := make([]state.Command, batchSize)
@@ -963,11 +1006,49 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	proposals[0] = propose
 	for i := 1; i < batchSize; i++ {
 		prop := <-r.ProposeChan
+		// fmt.Printf("missing command=%v\n", prop.Command.K)
 		cmds[i] = prop.Command
 		proposals[i] = prop
 	}
 
+	dlog.Printf("REPLICA ID = %d\n", r.Id)
+	dlog.Printf("INSTANCE NUMBER = %d\n", instNo)
+	dlog.Printf("NUMBER OF PROPOSALS = %d\n", len(proposals))
+	for i := 0; i < len(proposals); i++ {
+		dlog.Printf("PROPOSAL FOR KEY = %d\n", proposals[i].Command.K)
+	}
+
+	fmt.Println("Updating Data Structures")
+	r.storeValues(proposals)
+
+	// remove the hot proposals to stop going to phase 1
+	for i := 0; i < len(proposals); i++ {
+		fmt.Println("HOT KEY TO CHECK FOR REMOVE = %d\n", proposals[i].Command.K)
+		_, isPresent := r.HotKeyHistory[proposals[i].Command.K]
+		for isPresent {
+			// remove it from proposals
+			fmt.Println("HOT KEY TO REMOVE = %d\n", proposals[i].Command.K)
+			// if it is the last proposal: resize the slice
+			if i == len(proposals)-1 {
+				proposals[len(proposals)-1] = nil
+				proposals = proposals[:len(proposals)-1]
+				break
+			}
+			// else
+			copy(proposals[i:], proposals[i+1:])     // shift proposals[i+1:] left one index
+			proposals[len(proposals)-1] = nil        // erase last element
+			proposals = proposals[:len(proposals)-1] // truncate slice
+			_, isPresentAgain := r.HotKeyHistory[proposals[i].Command.K]
+			isPresent = isPresentAgain
+		}
+	}
+
+	for i := 0; i < len(proposals); i++ {
+		dlog.Printf("PROPOSAL FOR KEY AFTER TRUNCATING HOT KEYS = %d\n", proposals[i].Command.K)
+	}
+
 	r.startPhase1(r.Id, instNo, 0, proposals, cmds, batchSize)
+
 }
 
 func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, proposals []*genericsmr.Propose, cmds []state.Command, batchSize int) {
@@ -999,7 +1080,7 @@ func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, propo
 	r.recordInstanceMetadata(r.InstanceSpace[r.Id][instance])
 	r.recordCommands(cmds)
 	r.sync()
-
+	fmt.Println("calling bcastPreAccept")
 	r.bcastPreAccept(r.Id, instance, ballot, cmds, seq, deps)
 
 	cpcounter += batchSize
@@ -1134,6 +1215,7 @@ func (r *Replica) handlePreAccept(preAccept *epaxosproto.PreAccept) {
 				seq,
 				deps,
 				r.CommittedUpTo})
+
 	} else {
 		pok := &epaxosproto.PreAcceptOK{preAccept.Instance}
 		r.SendMsg(preAccept.LeaderId, r.preAcceptOKRPC, pok)
@@ -1221,11 +1303,11 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 		slow++
 
 		// Detecting slow path keys
-		for i := 0; i < len(inst.Cmds); i++ {
+		/*for i := 0; i < len(inst.Cmds); i++ {
 			cmd := inst.Cmds[i]
-			r.keyHistory[cmd.K].keyInSlowPath += 1
+			r.keyHistory[cmd.K].keyInSlowPath += 1 // no way to get key
 			log.Println("Hot Key ========== %d\n", cmd.K)
-		}
+		}*/
 		// Detecting slow path keys
 
 		inst.Status = epaxosproto.ACCEPTED
@@ -1236,7 +1318,8 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 }
 
 func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
-	dlog.Printf("Handling PreAccept reply\n")
+	dlog.Printf("Handling PreAccept OK\n")
+
 	inst := r.InstanceSpace[r.Id][pareply.Instance]
 
 	if inst.Status != epaxosproto.PREACCEPTED {
@@ -1249,6 +1332,10 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 	}
 
 	inst.lb.preAcceptOKs++
+
+	for i := 0; i < len(inst.Cmds); i++ {
+		dlog.Printf("HANDLING PREACCEPT OK FOR KEYS %d\n", inst.Cmds[i].K)
+	}
 
 	allCommitted := true
 	for q := 0; q < r.N; q++ {
@@ -1279,6 +1366,7 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 						inst.lb.clientProposals[i].Timestamp},
 					inst.lb.clientProposals[i].Reply)
 			}
+			dlog.Printf("OK sent to client n")
 		}
 
 		r.recordInstanceMetadata(inst)
@@ -1292,11 +1380,11 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 		slow++
 
 		// Detecting slow path keys
-		for i := 0; i < len(inst.Cmds); i++ {
+		/*for i := 0; i < len(inst.Cmds); i++ {
 			cmd := inst.Cmds[i]
 			r.keyHistory[cmd.K].keyInSlowPath += 1
 			log.Println("Hot Key ========== %d\n", cmd.K)
-		}
+		}*/
 		// Detecting slow path keys
 
 		inst.Status = epaxosproto.ACCEPTED
@@ -1367,6 +1455,7 @@ func (r *Replica) handleAccept(accept *epaxosproto.Accept) {
 }
 
 func (r *Replica) handleAcceptReply(areply *epaxosproto.AcceptReply) {
+	dlog.Printf("Handling Accept reply\n")
 	inst := r.InstanceSpace[areply.Replica][areply.Instance]
 
 	if inst.Status != epaxosproto.ACCEPTED {
@@ -1433,9 +1522,11 @@ func (r *Replica) handleCommit(commit *epaxosproto.Commit) {
 	}
 
 	if inst != nil {
+		dlog.Printf("instance not nil during commit")
 		if inst.lb != nil && inst.lb.clientProposals != nil && len(commit.Command) == 0 {
 			//someone committed a NO-OP, but we have proposals for this instance
 			//try in a different instance
+			dlog.Printf("Client proposals not nil during commit, calling proposeChan")
 			for _, p := range inst.lb.clientProposals {
 				r.ProposeChan <- p
 			}
@@ -1445,6 +1536,7 @@ func (r *Replica) handleCommit(commit *epaxosproto.Commit) {
 		inst.Deps = commit.Deps
 		inst.Status = epaxosproto.COMMITTED
 	} else {
+		dlog.Printf("instance nil during commit")
 		r.InstanceSpace[commit.Replica][int(commit.Instance)] = &Instance{
 			commit.Command,
 			0,
@@ -1481,8 +1573,10 @@ func (r *Replica) handleCommitShort(commit *epaxosproto.CommitShort) {
 	}
 
 	if inst != nil {
+		dlog.Printf("instance not nil during commitShort")
 		if inst.lb != nil && inst.lb.clientProposals != nil {
 			//try command in a different instance
+			dlog.Printf("Client proposals not nil during commitShort, calling proposeChan")
 			for _, p := range inst.lb.clientProposals {
 				r.ProposeChan <- p
 			}
@@ -1492,6 +1586,7 @@ func (r *Replica) handleCommitShort(commit *epaxosproto.CommitShort) {
 		inst.Deps = commit.Deps
 		inst.Status = epaxosproto.COMMITTED
 	} else {
+		dlog.Printf("instance nil during commitShort")
 		r.InstanceSpace[commit.Replica][commit.Instance] = &Instance{
 			nil,
 			0,
